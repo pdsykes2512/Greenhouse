@@ -151,25 +151,43 @@ float AbsoluteHumidity(float temp, float relative)
   return (6.1121 * pow(2.718281828, (17.67 * temp) / (temp + 243.5)) * relative * MOLAR_MASS_OF_WATER) / ((273.15 + temp) * UNIVERSAL_GAS_CONSTANT);
 }
 
+void WiFiConnected(WiFiEvent_t event, WiFiEventInfo_t info){
+  SerialDebug.println("Connected to AP successfully!");
+}
+
+void WiFiGotIP(WiFiEvent_t event, WiFiEventInfo_t info){
+  SerialDebug.println("WiFi connected");
+  SerialDebug.println("IP address: ");
+  SerialDebug.println(WiFi.localIP());
+}
+
+void WiFiDisconnected(WiFiEvent_t event, WiFiEventInfo_t info){
+  #ifdef SERIAL_DEBUG
+    SerialDebug.println("Disconnected from WiFi access point");
+    SerialDebug.print("WiFi lost connection. Reason: ");
+    SerialDebug.println(info.wifi_sta_disconnected.reason);
+    SerialDebug.println("Trying to Reconnect");
+  #endif
+  WiFi.begin(ssid, password);
+}
+
 // Initialise WiFi function
 void initWiFi(uint8_t wait)
 {
+  // Delete old config
+  WiFi.disconnect(true);
+
+  delay(1000);
+
+  WiFi.onEvent(WiFiConnected, WiFiEvent_t::ARDUINO_EVENT_WIFI_STA_CONNECTED);
+  WiFi.onEvent(WiFiGotIP, WiFiEvent_t::ARDUINO_EVENT_WIFI_STA_GOT_IP);
+  WiFi.onEvent(WiFiDisconnected, WiFiEvent_t::ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
-#ifndef TELNET_DEBUG
-  SerialDebug.print("Connecting to WiFi...");
-#endif
-  while (WiFi.status() != WL_CONNECTED && wait--)
-  {
-#ifndef TELNET_DEBUG
-    SerialDebug.print('.');
-#endif
-    delay(1000);
-  }
-  SerialDebug.println();
-  SerialDebug.println("\r\nConnected to Wi-Fi sucessfully.");
-  SerialDebug.print("IP address: ");
-  SerialDebug.println(WiFi.localIP());
+  #ifdef SERIAL_DEBUG
+    SerialDebug.print("\r\nConnecting to WiFi...");
+  #endif
 }
 
 // Post data to database via http function
@@ -465,53 +483,55 @@ void updateDisplay()
 // Program setup
 void setup()
 {
-// Initialise WiFi connection
-#ifdef TELNET_DEBUG
-  initWiFi(10);
-  SerialDebug.begin();
+  // Initialise WiFi connection
+  #ifdef TELNET_DEBUG
+    initWiFi(10);           // Initialise WiFi before telnet debug serial is set up or boot will stall
+    SerialDebug.begin();
+  #else
+    SerialDebug.begin(115200);
+    initWiFi(10);
+  #endif
+
   SerialDebug.println("\r\nSoil Moisture Control System");
-#else
-#ifdef SERIAL_DEBUG
-  SerialDebug.begin(115200);
-#endif
-  SerialDebug.println("\r\nSoil Moisture Control System");
-  initWiFi(10);
-#endif
-  WiFi.setAutoReconnect(true);
-  WiFi.persistent(true);
 
   // Allow OTA updates
   ArduinoOTA.setHostname(SYSTEM_HOSTNAME);
   ArduinoOTA.setPassword(FLASH_PWD);
 
   ArduinoOTA.onStart([]()
-                     {
-    String type;
-    if (ArduinoOTA.getCommand() == U_FLASH) {
-      type = "sketch";
-    } else {  // U_SPIFFS
-      type = "filesystem";
-    }
-    // NOTE: if updating SPIFFS this would be the place to unmount SPIFFS using SPIFFS.end()
-    SerialDebug.println("\nStart updating..." + type); });
+    {
+      String type;
+      if (ArduinoOTA.getCommand() == U_FLASH) {
+        type = "sketch";
+      } else {  // U_SPIFFS
+        type = "filesystem";
+      }
+      // NOTE: if updating SPIFFS this would be the place to unmount SPIFFS using SPIFFS.end()
+      SerialDebug.println("\nStart updating..." + type);
+    });
   ArduinoOTA.onEnd([]()
-                   { SerialDebug.println("\nEnd"); });
+    {
+      SerialDebug.println("\nEnd");
+    });
   ArduinoOTA.onProgress([](unsigned int progress, unsigned int total)
-                        { SerialDebug.printf("Progress: %u%%\r", (progress / (total / 100))); });
+    {
+      SerialDebug.printf("Progress: %u%%\r", (progress / (total / 100)));
+    });
   ArduinoOTA.onError([](ota_error_t error)
-                     {
-    SerialDebug.printf("Error[%u]: ", error);
-    if (error == OTA_AUTH_ERROR) {
-      SerialDebug.println("Auth Failed");
-    } else if (error == OTA_BEGIN_ERROR) {
-      SerialDebug.println("Begin Failed");
-    } else if (error == OTA_CONNECT_ERROR) {
-      SerialDebug.println("Connect Failed");
-    } else if (error == OTA_RECEIVE_ERROR) {
-      SerialDebug.println("Receive Failed");
-    } else if (error == OTA_END_ERROR) {
-      SerialDebug.println("End Failed");
-    } });
+    {
+      SerialDebug.printf("Error[%u]: ", error);
+      if (error == OTA_AUTH_ERROR) {
+        SerialDebug.println("Auth Failed");
+      } else if (error == OTA_BEGIN_ERROR) {
+        SerialDebug.println("Begin Failed");
+      } else if (error == OTA_CONNECT_ERROR) {
+        SerialDebug.println("Connect Failed");
+      } else if (error == OTA_RECEIVE_ERROR) {
+        SerialDebug.println("Receive Failed");
+      } else if (error == OTA_END_ERROR) {
+        SerialDebug.println("End Failed");
+      }
+    });
   ArduinoOTA.begin();
 
   // Connect to NTP time server to update RTC clock
