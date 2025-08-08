@@ -26,7 +26,7 @@
 #define SerialDebug Serial
 #endif
 
-#define SERIAL_DEBUG true
+#define SERIAL_DEBUG false
 
 // Setup I2C for display and SHT sensor
 #define OLED_RESET -1
@@ -65,6 +65,10 @@ NTPClient timeClient(ntpUDP);
 WiFiClient wifiClient; // Must be global or it will cause resets!
 const char *ssid = SSID;
 const char *password = PSK;
+
+uint32_t misters_timer;
+bool misters_valve;
+uint8_t active_plant = 0;
 
 // Set up plants
 typedef struct
@@ -273,12 +277,16 @@ struct VH400 readVH400(int analogPin, int nMeasurements, int delayBetweenMeasure
   double sensorVoltages[nMeasurements];
   double sensorVWCs[nMeasurements];
 
+  // Set up the pin
+  pinMode(analogPin, INPUT);
+  delayOTA(100);
+
   // Make measurements and add to arrays
   for (int i = 0; i < nMeasurements; i++) { 
     // Read value and convert to voltage 
     int sensorDN = analogRead(analogPin);
-    double sensorVoltage = sensorDN*(3.0 / 4095.0);
-        
+    double sensorVoltage = sensorDN * (3.0 / 4095.0);
+
     // Calculate VWC
     float VWC;
     if (sensorVoltage <= 1.1)
@@ -293,9 +301,13 @@ struct VH400 readVH400(int analogPin, int nMeasurements, int delayBetweenMeasure
     {
       VWC = 48.08 * sensorVoltage - 47.5;
     }
-    else if (sensorVoltage > 1.82)
+    else if (sensorVoltage > 1.82 && sensorVoltage <= 2.2)
     {
       VWC = 26.32 * sensorVoltage - 7.89;
+    }
+    else
+    {
+      VWC = 62.5 * sensorVoltage - 87.5;
     }
 
     // Add to statistics sums
@@ -337,83 +349,6 @@ struct VH400 readVH400(int analogPin, int nMeasurements, int delayBetweenMeasure
 
   // Return the result
   return(result);
-}
-
-// Read plant sensor function
-void readSensors(uint8_t p)
-{
-  // Read temperature sensor
-  // soilTemp.requestTemperatures();
-  // plant[plant_no].soil_temp = soilTemp.getTempCByIndex(plant_config[plant_no].temp_sensor);
-  int moistureReading;
-  float moistureVoltage;
-  plant[p].soil_temp = 0;
-
-  // Read moisture sensor
-  pinMode(plant_config[p].soil_pin, INPUT_PULLDOWN);
-  delayOTA(100);
-  if (plant_config[p].active)
-  {
-    if (analogRead(plant_config[p].soil_pin) < 100)
-    { // Set value to zero if no sensor detected
-      plant[p].soil_moisture = 0;
-    }
-    else
-    { // Otherwise read sensor again for accurate value
-      pinMode(plant_config[p].soil_pin, INPUT);
-      delayOTA(100);
-      plant[p].soil_moisture = readVH400(plant_config[p].soil_pin, 100, 50).VWC;
-    }
-  }
-  else
-  {
-    plant[p].soil_moisture = 0;
-  }
-}
-
-// Update pump and relay conditions function
-void waterControl()
-{
-  uint8_t p;
-  SerialDebug.println();
-
-  // Check whether pump should be on/off
-  bool pump_state = closed;
-  for (p = 0; p < NUMBER_OF_PLANTS; p++)
-  {
-    if (plant[p].valve_state == open && plant_config[p].active)
-    {
-      pump_state = open;
-    }
-  }
-
-  // Turn pump off if not requires and update valves as per plant states
-  if (pump_state == open)
-  {
-    for (p = 0; p < NUMBER_OF_PLANTS; p++)
-    {
-      if (plant_config[p].active)
-      {
-        digitalWrite(plant_config[p].valve_relay, plant[p].valve_state);
-        SerialDebug.printf("Valve %i: %d\t", p + 1, plant[p].valve_state);
-      }
-    }
-    delayOTA(500);
-    digitalWrite(PUMP_RELAY, open);
-    SerialDebug.println("Pump ON");
-  }
-  // Otherwise update valves as per plant states and turn pump on
-  else
-  {
-    digitalWrite(PUMP_RELAY, closed);
-    delayOTA(2000);
-    for (p = 0; p < NUMBER_OF_PLANTS; p++)
-    {
-      digitalWrite(plant_config[p].valve_relay, plant[p].valve_state);
-      SerialDebug.printf("Valve %i: %d\t", p + 1, plant[p].valve_state);
-    }
-    SerialDebug.println("Pump OFF\t");
-  }
 }
 
 // Refresh OLED display
@@ -478,6 +413,97 @@ void updateDisplay()
     display.println();
     display.display();
   }
+}
+
+// Read plant sensor function
+void readSensors(uint8_t p)
+{
+  // Read temperature sensor
+  // soilTemp.requestTemperatures();
+  // plant[plant_no].soil_temp = soilTemp.getTempCByIndex(plant_config[plant_no].temp_sensor);
+  int moistureReading;
+  float moistureVoltage;
+  plant[p].soil_temp = 0;
+
+  // Read moisture sensor
+  pinMode(plant_config[p].soil_pin, INPUT_PULLDOWN);
+  delayOTA(100);
+  if (plant_config[p].active)
+  {
+    if (analogRead(plant_config[p].soil_pin) < 100)
+    { // Set value to zero if no sensor detected
+      plant[p].soil_moisture = 0;
+    }
+    else
+    { // Otherwise read sensor again for accurate value
+      plant[p].soil_moisture = readVH400(plant_config[p].soil_pin, 100, 5).VWC;
+    }
+  }
+  else
+  {
+    plant[p].soil_moisture = 0;
+  }
+}
+
+// Water plant function
+void waterPlant(uint8_t p)
+{
+  float progress_calc = ((((millis() - plant[p].valve_timer) / 1000.0) / plant_config[p].water_time_on) * 100);
+
+  // Water plants one at a time to avoid path of least resistance
+  if (plant_config[p].active)
+  {
+    if (plant[p].valve_state == open)
+    {
+      plant[p].soil_moisture = readVH400(plant_config[p].soil_pin, 10, 5).VWC;
+      if (plant[p].water_level == 1)
+      {
+        digitalWrite(plant_config[p].valve_relay, open);
+        SerialDebug.printf("Watering plant %i\n", p + 1);
+        plant[p].water_level = 0;
+        plant[p].valve_timer = millis();  // Reset valve_timer
+
+        // Update display
+        updateDisplay();
+      }
+      else if (progress_calc >= 100
+        || plant[p].soil_moisture > plant_config[p].soil_moisture_wet)
+      {
+        // Turn off valve if time exceeded or soil moisture is wet
+        digitalWrite(plant_config[p].valve_relay, closed);
+        plant[p].valve_state = closed;
+        SerialDebug.printf("Stopping watering plant %i\n", p + 1);
+
+        // Update display
+        updateDisplay();
+        plant[p].valve_timer = millis();
+        
+        // Progress to next plant
+        p+= 1;
+        if (p >= NUMBER_OF_PLANTS)
+        {
+          p = 0;
+        }
+      }
+      else
+      {
+        // Update progress bar
+        plant[p].progress_bar = 100 - progress_calc;
+        SerialDebug.printf("Plant %i, water progress: %i%%\n", p + 1, plant[p].progress_bar);
+        updateDisplay();  // Update OLED display
+      }
+    }
+    else
+    {
+      // Progress to next plant
+      p+= 1;
+      if (p >= NUMBER_OF_PLANTS)
+      {
+        p = 0;
+      }
+    }
+  }
+  active_plant = p;
 }
 
 // Program setup
@@ -585,6 +611,7 @@ void loop()
   bool update_water = false;
   uint32_t waterProgress;
   float a, b;
+  float progress_calc = 0;
 
   ArduinoOTA.handle();
 
@@ -646,21 +673,54 @@ void loop()
       // SerialDebug.printf("Plant %i: %.1f%%\t", i + 1, plant[i].soil_moisture);
     }
 
-    // Turn relays on
+    // Turn plant relays on
     for (i = 0; i < NUMBER_OF_PLANTS; i++)
     {
-      if ((plant[i].soil_moisture < plant_config[i].soil_moisture_dry) && (plant_config[i].active) && (plant[i].valve_state == closed) && (((millis() - plant[i].valve_timer) / 1000) > plant_config[i].water_time_off))
+      // Calculate progress to next watering
+      progress_calc = ((((millis() - plant[i].valve_timer) / 1000.0) / plant_config[i].water_time_off) * 100);
+      
+      if (plant[i].soil_moisture < plant_config[i].soil_moisture_dry
+        && plant_config[i].active
+        && plant[i].valve_state == closed
+        && progress_calc >= 100)
       {
         plant[i].valve_state = open;
         plant[i].water_level = 1;
-        update_water = true;
-        plant[i].valve_timer = millis();
       }
+
+      // Calculate progress bar
+      if (progress_calc < 100)
+      {
+        plant[i].progress_bar = progress_calc;
+      }
+      else
+      {
+        plant[i].progress_bar = 100;
+      }
+      // Print progress bar status
+      SerialDebug.printf("Plant %i, progress to next water: %i%%\n", i + 1, plant[i].progress_bar);
     }
-    if (update_water)
+    // Turn misters on if interval exceeded
+    if (MISTERS_ACTIVE)
     {
-      waterControl(); // Update pump and valve status
-      update_water = false;
+      if (((millis() - misters_timer) / 1000 > MISTERS_INTERVAL) && (temperature > MISTERS_TEMP))
+      {
+        misters_valve = open;
+        digitalWrite(VALVE5_RELAY, open);
+        misters_timer = millis();
+      }
+      else if (((millis() - misters_timer) / 1000 > MISTERS_WATER_ON) && (misters_valve == open))
+      {
+        misters_valve = closed;
+        digitalWrite(VALVE5_RELAY, closed);
+        misters_timer = millis();
+      }
+      else if ((temperature < MISTERS_TEMP) && (misters_valve == open))
+      {
+        digitalWrite(VALVE5_RELAY, open);
+        misters_timer = millis();
+        misters_valve = open;
+      }
     }
 
     // Create post string and post to database
@@ -692,6 +752,7 @@ void loop()
     httpPost(mysql_url, post_data);
 
     updateDisplay(); // Update OLED display
+    waterPlant(active_plant);
 
     last_min = clk.tm_min; // Update timer related variables
   }
@@ -701,58 +762,20 @@ void loop()
   {
     SerialDebug.printf("Timer: %u\t", clk.tm_sec);
 
-    // Turn relays off when timer reached
-    for (i = 0; i < NUMBER_OF_PLANTS; i++)
+    // Turn misters off if timer reached
+    if (misters_valve == open)
     {
-      if (plant[i].valve_state == open)
-      {
-        if (plant_config[i].active)
+      if (MISTERS_ACTIVE)
+        if ((millis() - misters_timer) / 1000 > MISTERS_WATER_ON)
         {
-          readSensors(i);
+          digitalWrite(VALVE5_RELAY, closed);
+          misters_timer = millis();
         }
-        if (((millis() - plant[i].valve_timer) / 1000 > plant_config[i].water_time_on) || (plant[i].soil_moisture > plant_config[i].soil_moisture_wet))
-        {
-          plant[i].valve_state = closed;
-          plant[i].water_level = 0;
-          plant[i].valve_timer = millis();
-          update_water = true;
-        }
-        a = timer;
-        b = plant_config[i].water_time_on;
-        if (b - a > 0)
-        {
-          waterProgress = 100 * float((b - a) / b);
-          plant[i].progress_bar = waterProgress;
-        }
-        else
-        {
-          plant[i].progress_bar = 0;
-        }
-      }
-      else
-      {
-        a = (millis() - plant[i].valve_timer) / 1000;
-        b = plant_config[i].water_time_off;
-        waterProgress = 100 * float(a / b);
-        if (waterProgress > 100)
-        {
-          plant[i].progress_bar = 100;
-        }
-        else
-        {
-          plant[i].progress_bar = waterProgress;
-          // SerialDebug.printf("\nProgress: %i/%i = %i\n", a, b, plant[i].progress_bar);
-        }
-      }
-      SerialDebug.printf("Plant %i: %.1f%%, %i, %i%%\t", i + 1, plant[i].soil_moisture, plant[i].water_level, plant[i].progress_bar);
     }
-    updateDisplay(); // Update OLED display
+
+    waterPlant(active_plant);
+    
     SerialDebug.print("\r");
-    if (update_water)
-    {
-      waterControl(); // Update pump and valve status
-      update_water = false;
-    }
 
     // Update timer related variables
     last_sec = clk.tm_sec;
