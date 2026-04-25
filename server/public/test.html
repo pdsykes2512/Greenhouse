@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Test Valve Control</title>
+</head>
+<body>
+    <h1>Valve Control Test</h1>
+    <button onclick="testValve(3, true)">Open Valve 3</button>
+    <button onclick="testValve(3, false)">Close Valve 3</button>
+    <div id="result"></div>
+    
+    <script>
+    async function testValve(valveNum, state) {
+        const result = document.getElementById('result');
+        result.innerHTML = 'Sending request...';
+        
+        try {
+            const response = await fetch('/api/control', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    action: 'valve',
+                    valve: valveNum,
+                    state: state
+                })
+            });
+            
+            const data = await response.json();
+            result.innerHTML = 'Success: ' + JSON.stringify(data);
+        } catch (error) {
+            result.innerHTML = 'Error: ' + error.message;
+        }
+    }
+    </script>
+</body>
+</html>

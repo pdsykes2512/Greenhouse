@@ -1,0 +1,6 @@
+node_modules/
+greenhouse.db
+greenhouse.db.backup
+*.log
+.env
+.DS_Store
