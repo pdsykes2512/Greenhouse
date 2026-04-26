@@ -85,6 +85,26 @@ function initDatabase() {
       )
     `);
 
+    // Web Push subscriptions
+    db.run(`
+      CREATE TABLE IF NOT EXISTS push_subscriptions (
+        endpoint TEXT PRIMARY KEY,
+        subscription TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Recent alert log — used to dedupe so we don't spam the same notification
+    db.run(`
+      CREATE TABLE IF NOT EXISTS alert_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind TEXT NOT NULL,
+        plant_number INTEGER,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_alert_log_kind_ts ON alert_log(kind, timestamp)`);
+
     // Per-plant watering settings
     db.run(`
       CREATE TABLE IF NOT EXISTS plant_config (
@@ -445,6 +465,51 @@ const database = {
         if (err) return callback(err);
         callback(null, row || { temp_high: null, temp_low: null });
       }
+    );
+  },
+
+  // ─── Push subscriptions ────────────────────────────────────────────────────
+  addPushSubscription: (subscription, callback) => {
+    db.run(
+      `INSERT OR REPLACE INTO push_subscriptions (endpoint, subscription) VALUES (?, ?)`,
+      [subscription.endpoint, JSON.stringify(subscription)],
+      callback
+    );
+  },
+
+  removePushSubscription: (endpoint, callback) => {
+    db.run(`DELETE FROM push_subscriptions WHERE endpoint = ?`, [endpoint], callback);
+  },
+
+  getAllPushSubscriptions: (callback) => {
+    db.all(`SELECT subscription FROM push_subscriptions`, (err, rows) => {
+      if (err) return callback(err);
+      callback(null, rows.map(r => JSON.parse(r.subscription)));
+    });
+  },
+
+  // ─── Alert log (for deduplication) ─────────────────────────────────────────
+  // Returns the most recent alert of a given kind+plant, so the alert engine
+  // can decide whether to re-fire (e.g. don't spam the same dry-too-long
+  // alert every minute).
+  getLastAlert: (kind, plantNumber, callback) => {
+    db.get(
+      `SELECT timestamp FROM alert_log
+       WHERE kind = ? AND (plant_number IS ? OR plant_number = ?)
+       ORDER BY id DESC LIMIT 1`,
+      [kind, plantNumber, plantNumber],
+      (err, row) => {
+        if (err) return callback(err);
+        callback(null, row ? row.timestamp : null);
+      }
+    );
+  },
+
+  recordAlert: (kind, plantNumber, callback) => {
+    db.run(
+      `INSERT INTO alert_log (kind, plant_number) VALUES (?, ?)`,
+      [kind, plantNumber],
+      callback
     );
   },
 

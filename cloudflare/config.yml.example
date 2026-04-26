@@ -1,0 +1,22 @@
+# Cloudflare Tunnel config — copy to /etc/cloudflared/config.yml
+# Replace <UUID> with the tunnel ID printed by `cloudflared tunnel create greenhouse`
+# Replace greenhouse.example.com with the hostname you'll route to this tunnel
+
+tunnel: <UUID>
+credentials-file: /etc/cloudflared/<UUID>.json
+
+# Optional: keep keepalives short so the tunnel reconnects fast after a network blip
+metrics: 127.0.0.1:55000
+no-autoupdate: true
+
+ingress:
+  # Public hostname → local Node server
+  - hostname: greenhouse.example.com
+    service: http://localhost:3000
+    originRequest:
+      # The Node server runs HTTP locally; let cloudflared do TLS termination
+      noTLSVerify: true
+      connectTimeout: 10s
+
+  # Required catch-all rule
+  - service: http_status:404

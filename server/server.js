@@ -4,6 +4,7 @@ const bodyParser = require('body-parser');
 const path = require('path');
 const apiRoutes = require('./routes/api');
 const db = require('./database');
+const alerts = require('./alerts');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -22,8 +23,17 @@ app.use((req, res, next) => {
 // API routes
 app.use('/api', apiRoutes);
 
-// Serve static files (web UI)
-app.use(express.static(path.join(__dirname, 'public')));
+// Serve static files (web UI). For files that frequently change (HTML shell,
+// service worker, app code, manifest), tell the browser AND Cloudflare not
+// to cache — this prevents stale versions sticking around at the edge.
+app.use(express.static(path.join(__dirname, 'public'), {
+  setHeaders: (res, filePath) => {
+    const name = path.basename(filePath);
+    if (name === 'sw.js' || name === 'index.html' || name === 'app.js' || name === 'manifest.json') {
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    }
+  }
+}));
 
 // Root endpoint
 app.get('/', (req, res) => {
@@ -66,6 +76,9 @@ app.listen(PORT, () => {
   console.log(`Web UI: http://localhost:${PORT}`);
   console.log('=================================');
 });
+
+// Start alert engine (scans every 60s for important events, fires push notifications)
+alerts.start(60);
 
 // Auto-clear pump override after 5 minutes
 const PUMP_OVERRIDE_TIMEOUT_MINS = 5;

@@ -146,6 +146,33 @@ bool NetworkManager::postSensorData(EnvironmentData& env, const PlantState plant
     }
 }
 
+bool NetworkManager::clearValveOverride(uint8_t plantNumber) {
+    if (!isConnected()) return false;
+
+    HTTPClient http;
+    http.begin(String(SERVER_URL) + "/api/control");
+    http.addHeader("Content-Type", "application/json");
+    http.setTimeout(HTTP_TIMEOUT);
+
+    JsonDocument doc;
+    doc["action"] = "valve";
+    doc["valve"]  = plantNumber;
+    doc["state"]  = false;
+
+    String payload;
+    serializeJson(doc, payload);
+
+    int code = http.POST(payload);
+    http.end();
+
+    if (code == 200) {
+        Serial.printf("Cleared manual override for plant %d on server\n", plantNumber);
+        return true;
+    }
+    Serial.printf("Failed to clear override for plant %d: HTTP %d\n", plantNumber, code);
+    return false;
+}
+
 bool NetworkManager::getCommands(SystemCommands& commands) {
     if (!isConnected()) {
         return false;

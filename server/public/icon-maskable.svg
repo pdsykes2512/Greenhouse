@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- Maskable icon: artwork must stay in the centre 80% so launchers can crop -->
+  <rect width="512" height="512" fill="#16a34a"/>
+  <g transform="translate(256 290) scale(0.8)">
+    <path d="M -120 0 C -120 -105 -25 -175 95 -175 C 95 -65 25 15 -65 40 Z" fill="#86efac"/>
+    <path d="M -120 0 C -65 -25 0 -65 65 -120" stroke="#16a34a" stroke-width="8" fill="none" stroke-linecap="round"/>
+    <path d="M 0 160 L 0 -25" stroke="#15803d" stroke-width="16" stroke-linecap="round"/>
+    <path d="M -95 160 L 95 160 L 75 245 L -75 245 Z" fill="#fef3c7"/>
+    <line x1="-95" y1="160" x2="95" y2="160" stroke="#fbbf24" stroke-width="10"/>
+  </g>
+</svg>

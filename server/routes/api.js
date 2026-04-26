@@ -1,6 +1,47 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../database');
+const push = require('../push');
+const sse = require('../sse');
+
+// Build the shared status payload used by /api/status and SSE broadcasts.
+// Returns the same shape both consumers expect.
+function buildStatusPayload(callback) {
+  db.getLatestReading((err, reading) => {
+    if (err) return callback(err);
+    db.getCommands((err, commands) => {
+      if (err) return callback(err);
+      db.getStats((err, stats) => {
+        if (err) stats = {};
+        db.getAllPlantConfigs((err, plantConfigs) => {
+          if (err) plantConfigs = {};
+          db.getDailyTempRange((err, range) => {
+            if (err) range = {};
+            if (reading && range) {
+              if (range.temp_high != null) reading.temp_high = range.temp_high;
+              if (range.temp_low  != null) reading.temp_low  = range.temp_low;
+            }
+            callback(null, {
+              latest_reading: reading,
+              system_state:   commands,
+              stats,
+              plant_configs:  plantConfigs
+            });
+          });
+        });
+      });
+    });
+  });
+}
+
+// Push the current status to every SSE-connected client. Called after /api/data,
+// /api/control, and /api/calibrate so the dashboard updates instantly.
+function broadcastStatus() {
+  buildStatusPayload((err, payload) => {
+    if (err) return;
+    sse.broadcast('status', payload);
+  });
+}
 
 // POST /api/data - Receive sensor data from ESP32
 router.post('/data', (req, res) => {
@@ -32,6 +73,8 @@ router.post('/data', (req, res) => {
         temp_high: range?.temp_high ?? null,
         temp_low:  range?.temp_low  ?? null
       });
+      // Push fresh status to all connected dashboards
+      broadcastStatus();
     });
   });
 });
@@ -55,46 +98,35 @@ router.get('/commands', (req, res) => {
   });
 });
 
-// GET /api/status - Current system status for web UI
+// GET /api/status - Current system status for web UI (initial load only;
+// SSE pushes subsequent updates via /api/events)
 router.get('/status', (req, res) => {
-  db.getLatestReading((err, reading) => {
+  buildStatusPayload((err, payload) => {
     if (err) {
-      console.error('Error getting latest reading:', err);
+      console.error('Error building status:', err);
       return res.status(500).json({ status: 'error', message: 'Database error' });
     }
+    res.json(payload);
+  });
+});
 
-    db.getCommands((err, commands) => {
-      if (err) {
-        console.error('Error getting commands:', err);
-        return res.status(500).json({ status: 'error', message: 'Database error' });
-      }
+// GET /api/events - Server-Sent Events stream for live dashboard updates
+router.get('/events', (req, res) => {
+  res.set({
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no'
+  });
+  res.flushHeaders();
 
-      db.getStats((err, stats) => {
-        if (err) stats = {};
+  sse.addClient(res);
 
-        db.getAllPlantConfigs((err, plantConfigs) => {
-          if (err) plantConfigs = {};
-
-          db.getDailyTempRange((err, range) => {
-            if (err) range = {};
-
-            // Override the per-reading temp_high/low with today's MIN/MAX from
-            // every reading, so the UI doesn't reset when the ESP32 reboots.
-            if (reading && range) {
-              if (range.temp_high != null) reading.temp_high = range.temp_high;
-              if (range.temp_low  != null) reading.temp_low  = range.temp_low;
-            }
-
-            res.json({
-              latest_reading: reading,
-              system_state:   commands,
-              stats:          stats,
-              plant_configs:  plantConfigs
-            });
-          });
-        });
-      });
-    });
+  // Send the current snapshot immediately so the client doesn't have to wait
+  // for the next change event.
+  buildStatusPayload((err, payload) => {
+    if (err) return;
+    res.write(`event: status\ndata: ${JSON.stringify(payload)}\n\n`);
   });
 });
 
@@ -147,6 +179,7 @@ router.post('/control', (req, res) => {
 
     console.log(`Command updated: ${command} = ${value}`);
     res.json({ status: 'ok', applied: true, command, value });
+    broadcastStatus();
   });
 });
 
@@ -204,6 +237,7 @@ router.post('/plant-config/:plant', (req, res) => {
       }
       console.log(`Plant ${plantNumber} config updated`);
       res.json({ status: 'ok', plant: plantNumber });
+      broadcastStatus();
     }
   );
 });
@@ -237,6 +271,7 @@ router.post('/calibrate/:plant', (req, res) => {
       }
       console.log(`Plant ${plantNumber} calibrated ${type} at ${voltage_mv} mV (reading ${row.timestamp})`);
       res.json({ status: 'ok', plant: plantNumber, type, voltage_mv, captured_at: row.timestamp });
+      broadcastStatus();
     });
   });
 });
@@ -308,6 +343,46 @@ router.get('/stats', (req, res) => {
     }
     res.json(stats);
   });
+});
+
+// ─── Web Push ─────────────────────────────────────────────────────────────────
+
+// GET /api/push/vapid-public-key — frontend needs this to subscribe
+router.get('/push/vapid-public-key', (req, res) => {
+  const key = push.getPublicKey();
+  if (!key) return res.status(503).json({ status: 'error', message: 'Push not configured' });
+  res.json({ key });
+});
+
+// POST /api/push/subscribe — store a browser subscription so we can push to it later
+router.post('/push/subscribe', (req, res) => {
+  const sub = req.body;
+  if (!sub || !sub.endpoint || !sub.keys) {
+    return res.status(400).json({ status: 'error', message: 'Invalid subscription' });
+  }
+  db.addPushSubscription(sub, (err) => {
+    if (err) {
+      console.error('Failed to store push subscription:', err);
+      return res.status(500).json({ status: 'error', message: 'Database error' });
+    }
+    res.json({ status: 'ok' });
+  });
+});
+
+// POST /api/push/test — fire a test notification to every subscriber
+router.post('/push/test', async (req, res) => {
+  try {
+    const result = await push.sendToAll({
+      title: 'Greenhouse test',
+      body: 'If you can see this, push notifications are working.',
+      tag: 'test',
+      url: '/'
+    });
+    res.json({ status: 'ok', ...result });
+  } catch (e) {
+    console.error('Push test failed:', e);
+    res.status(500).json({ status: 'error', message: e.message });
+  }
 });
 
 module.exports = router;

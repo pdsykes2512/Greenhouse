@@ -4,3 +4,4 @@ greenhouse.db.backup
 *.log
 .env
 .DS_Store
+vapid-keys.json

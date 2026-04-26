@@ -33,10 +33,11 @@ void WateringController::init() {
     Serial.println("Watering controller initialized");
 }
 
-void WateringController::update() {
+bool WateringController::update() {
     static unsigned long lastMoistureRead = 0;
     static unsigned long pumpOffTime     = 0;
     static bool          wasPumpActive   = false;
+    bool freshRead = false;
 
     bool anyOpen = false;
     for (int i = 0; i < NUM_PLANTS; i++) {
@@ -55,9 +56,16 @@ void WateringController::update() {
     //   1. No valve/pump is active
     //   2. Pump has been off for at least PUMP_OFF_SETTLE_SEC (electrical settling)
     //   3. At least 60 s since the last read
+    //   4. No plant is mid-cycle in measure-pause — its post-burst read needs
+    //      the full MEASURE_PAUSE_SEC settle window and we don't want to
+    //      pre-empt it with a routine read at PUMP_OFF_SETTLE_SEC seconds in.
     bool settled = (millis() - pumpOffTime) >= (PUMP_OFF_SETTLE_SEC * 1000UL);
+    bool anyMidCycle = false;
+    for (int i = 0; i < NUM_PLANTS; i++) {
+        if (plants[i].in_measure_pause) { anyMidCycle = true; break; }
+    }
 
-    if (!pumpActive && settled && millis() - lastMoistureRead >= 60000) {
+    if (!pumpActive && !anyMidCycle && settled && millis() - lastMoistureRead >= 60000) {
         // Read every sensor, regardless of plant_active state. Keeping the read
         // sequence constant means a sensor's value can't shift just because
         // another plant was toggled on/off in the UI.
@@ -71,18 +79,24 @@ void WateringController::update() {
             if (i < NUM_PLANTS - 1) delay(INTER_SENSOR_DELAY_MS);
         }
         lastMoistureRead = millis();
+        freshRead = true;
     }
 
-    // Update automatic watering logic
-    if (currentCommands.auto_mode) {
-        updateAutoWatering();
-    }
+    // Unified watering state machine — handles both auto and manual cycles.
+    // updateAutoWatering's per-plant logic checks plants_active vs. valve_overrides
+    // and respects auto_mode for auto-only triggers.
+    updateAutoWatering();
 
-    // Apply manual overrides
+    // Honour user clicking CLOSE mid-cycle
     updateManualOverrides();
 
     // Update pump based on valve states
     updatePump();
+
+    bool wasFresh = freshRead || freshReadThisTick || valveChangedThisTick;
+    freshReadThisTick = false;
+    valveChangedThisTick = false;
+    return wasFresh;
 }
 
 void WateringController::applyCommands(const SystemCommands& commands) {
@@ -112,7 +126,14 @@ void WateringController::updateAutoWatering() {
     }
 
     for (int i = 0; i < NUM_PLANTS; i++) {
-        if (!currentCommands.plants_active[i]) continue;
+        bool active = currentCommands.plants_active[i];
+        bool manual = currentCommands.valve_overrides[i];
+
+        // Process plants that are either auto-active OR manually triggered.
+        // Manual triggers run the same burst-measure-pause cycle as auto so the
+        // plant cannot be over-watered (cycle stops automatically when the wet
+        // threshold is reached).
+        if (!active && !manual) continue;
 
         const PlantSettings& config = currentCommands.plant_settings[i];
         PlantState& state = plants[i];
@@ -120,8 +141,8 @@ void WateringController::updateAutoWatering() {
         uint32_t elapsedTime = (millis() - state.valve_timer) / 1000;
 
         if (state.valve_open) {
-            // Close when the watering burst time is up; pump interference means we
-            // can't trust moisture readings while running, so time is the only criterion
+            // Burst in progress — close after water_duration_sec and enter
+            // the measure-pause to read moisture before deciding what's next.
             if (elapsedTime >= config.water_duration_sec) {
                 setValve(i, false);
                 state.valve_timer = millis();
@@ -129,12 +150,10 @@ void WateringController::updateAutoWatering() {
                 state.measure_pause_start = millis();
                 Serial.printf("Plant %d: Burst done, pausing to measure\n", i + 1);
             }
-
             state.progress_percent = 100 - ((elapsedTime * 100) / config.water_duration_sec);
             state.progress_percent = constrain(state.progress_percent, 0, 100);
 
         } else if (state.in_measure_pause) {
-            // Pump is off — wait for noise to settle, then read and decide
             state.progress_percent = 0;
             uint32_t pauseElapsed = (millis() - state.measure_pause_start) / 1000;
             if (pauseElapsed >= MEASURE_PAUSE_SEC) {
@@ -142,6 +161,7 @@ void WateringController::updateAutoWatering() {
                     PLANT_CONFIGS[i].soil_pin, config.dry_voltage_mv, config.wet_voltage_mv);
                 state.soil_voltage_mv = Sensors.getLastVoltageMv();
                 state.in_measure_pause = false;
+                freshReadThisTick = true;
                 Serial.printf("Plant %d: Post-burst moisture: %.1f%%\n", i + 1, state.soil_moisture);
 
                 if (state.soil_moisture < config.soil_wet_threshold && !valveAlreadyOpen) {
@@ -151,55 +171,66 @@ void WateringController::updateAutoWatering() {
                     valveAlreadyOpen = true;
                     Serial.printf("Plant %d: Still dry, running another burst\n", i + 1);
                 } else {
-                    // Wet enough — start normal cooldown from now
+                    // Wet enough — cycle complete. If it was a manual cycle,
+                    // tell main.cpp so it can release the override on the server.
                     state.valve_timer = millis();
+                    if (manuallyTriggered[i]) {
+                        manuallyTriggered[i] = false;
+                        completedManualCycles |= (1 << i);
+                        Serial.printf("Plant %d: Manual cycle complete, wet enough\n", i + 1);
+                    }
                 }
             }
 
         } else {
-            // Normal cooldown — open when dry and cooldown has elapsed
+            // Idle — decide whether to start a new cycle
             uint32_t cooldownProgress = (elapsedTime * 100) / config.cooldown_sec;
             state.progress_percent = constrain(cooldownProgress, 0, 100);
 
-            if (state.soil_moisture < config.soil_dry_threshold &&
-                elapsedTime >= config.cooldown_sec &&
-                !valveAlreadyOpen) {
+            bool needsWater = false;
+            if (manual) {
+                // Manual: water if not at wet threshold yet (cooldown bypassed)
+                needsWater = state.soil_moisture < config.soil_wet_threshold;
+            } else if (active) {
+                // Per-plant auto: water if dry AND cooldown has elapsed.
+                // (plants_active is now the per-plant auto-watering toggle —
+                // there's no longer a global auto_mode kill switch.)
+                needsWater = state.soil_moisture < config.soil_dry_threshold &&
+                             elapsedTime >= config.cooldown_sec;
+            }
+
+            if (needsWater && !valveAlreadyOpen) {
                 setValve(i, true);
                 state.valve_timer = millis();
                 valveAlreadyOpen = true;
-                Serial.printf("Plant %d: Needs water (%.1f%% < %.1f%%)\n",
-                              i + 1, state.soil_moisture, config.soil_dry_threshold);
+                manuallyTriggered[i] = manual;
+                Serial.printf("Plant %d: Watering started (%s, soil %.1f%%)\n",
+                              i + 1, manual ? "manual" : "auto", state.soil_moisture);
+            } else if (manual && !needsWater) {
+                // Manual was triggered but plant is already wet enough.
+                // Release the override so the user can re-trigger later.
+                completedManualCycles |= (1 << i);
+                Serial.printf("Plant %d: Manual ignored — already wet (%.1f%%)\n",
+                              i + 1, state.soil_moisture);
             }
         }
     }
 }
 
 void WateringController::updateManualOverrides() {
-    // Process closures first so a close+open in the same command set works correctly
+    // Sole responsibility now: if the user releases the override mid-cycle
+    // (clicks CLOSE), abort whatever's in flight. Auto-only opens are not
+    // touched here.
     for (int i = 0; i < NUM_PLANTS; i++) {
-        bool shouldBeOpen = currentCommands.valve_overrides[i] &&
-                            (currentCommands.plants_active[i] || currentCommands.valve_overrides[i]);
-        if (!shouldBeOpen && plants[i].valve_open) {
-            Serial.printf("Manual override: Valve %d -> CLOSED\n", i + 1);
+        if (currentCommands.valve_overrides[i]) continue;
+        if (!manuallyTriggered[i]) continue;
+
+        if (plants[i].valve_open) {
+            Serial.printf("Manual override released — closing valve %d\n", i + 1);
             setValve(i, false);
         }
-    }
-
-    // Then process opens, honouring the one-at-a-time rule
-    for (int i = 0; i < NUM_PLANTS; i++) {
-        if (!currentCommands.valve_overrides[i]) continue;
-
-        if (plants[i].valve_open) continue; // already open (this plant)
-
-        // Check no other valve is open
-        bool otherOpen = false;
-        for (int j = 0; j < NUM_PLANTS; j++) {
-            if (j != i && plants[j].valve_open) { otherOpen = true; break; }
-        }
-        if (otherOpen) continue;
-
-        Serial.printf("Manual override: Valve %d -> OPEN\n", i + 1);
-        setValve(i, true);
+        plants[i].in_measure_pause = false;
+        manuallyTriggered[i] = false;
     }
 }
 
@@ -238,9 +269,17 @@ void WateringController::setValve(uint8_t plantIndex, bool shouldOpen) {
         delay(300);
     }
 
+    bool wasOpen = plants[plantIndex].valve_open;
     plants[plantIndex].valve_open = shouldOpen;
     digitalWrite(PLANT_CONFIGS[plantIndex].valve_pin,
                  shouldOpen ? VALVE_OPEN : VALVE_CLOSED);
+
+    if (wasOpen != shouldOpen) {
+        // Force an immediate data POST so the server captures this transition
+        // before the valve closes again — short bursts (15 s) would otherwise
+        // never appear in the readings table and never show on the chart.
+        valveChangedThisTick = true;
+    }
 
     Serial.printf("Valve %d: %s\n", plantIndex + 1, shouldOpen ? "OPEN" : "CLOSED");
 }

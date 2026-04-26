@@ -14,6 +14,7 @@ public:
     void update();
     bool postSensorData(EnvironmentData& env, const PlantState plants[]);
     bool getCommands(SystemCommands& commands);
+    bool clearValveOverride(uint8_t plantNumber);  // 1-based plant number
     bool isConnected();
 
 private:

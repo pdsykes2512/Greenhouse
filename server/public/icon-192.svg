@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192">
+  <rect width="192" height="192" rx="36" fill="#16a34a"/>
+  <g transform="translate(96 110)">
+    <!-- Leaf -->
+    <path d="M -45 0 C -45 -40 -10 -65 35 -65 C 35 -25 10 5 -25 15 Z" fill="#86efac"/>
+    <path d="M -45 0 C -25 -10 0 -25 25 -45" stroke="#16a34a" stroke-width="3" fill="none" stroke-linecap="round"/>
+    <!-- Stem -->
+    <path d="M 0 60 L 0 -10" stroke="#15803d" stroke-width="6" stroke-linecap="round"/>
+    <!-- Pot -->
+    <path d="M -35 60 L 35 60 L 28 92 L -28 92 Z" fill="#fef3c7"/>
+    <line x1="-35" y1="60" x2="35" y2="60" stroke="#fbbf24" stroke-width="4"/>
+  </g>
+</svg>

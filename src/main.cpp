@@ -86,10 +86,13 @@ void loop() {
         lastSensorRead = millis();
     }
 
-    // Update watering logic every second
+    // Update watering logic every second. update() returns true if a fresh
+    // moisture read happened this tick — push it to the server immediately so
+    // the dashboard doesn't have to wait up to a minute for the next post.
     static unsigned long lastWateringUpdate = 0;
+    bool freshRead = false;
     if (millis() - lastWateringUpdate >= 1000) {
-        Watering.update();
+        freshRead = Watering.update();
         lastWateringUpdate = millis();
     }
 
@@ -99,10 +102,21 @@ void loop() {
         lastDisplayUpdate = millis();
     }
 
-    // Post sensor data to server every minute
-    if (millis() - lastDataPost >= DATA_POST_INTERVAL) {
+    // Post sensor data to server every minute, OR immediately after a fresh read
+    if (freshRead || millis() - lastDataPost >= DATA_POST_INTERVAL) {
         Network.postSensorData(environment, Watering.getPlantStates());
         lastDataPost = millis();
+    }
+
+    // When a manual cycle completes (wet enough OR ignored because already wet),
+    // tell the server to release the override so the user can re-trigger it later.
+    uint8_t completed = Watering.fetchAndClearCompletedManualCycles();
+    if (completed) {
+        for (int i = 0; i < NUM_PLANTS; i++) {
+            if (completed & (1 << i)) {
+                Network.clearValveOverride(i + 1);
+            }
+        }
     }
 
     // Heartbeat LED (blink every second)

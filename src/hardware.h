@@ -11,8 +11,10 @@
 #define VALVE_CLOSED LOW
 #define VALVE_OPEN HIGH
 
-// Seconds to wait after a watering burst before taking the post-burst reading
-#define MEASURE_PAUSE_SEC 60
+// Seconds to wait after a watering burst before taking the post-burst reading.
+// Long enough for ADC/sensor settling, short enough that the user sees the
+// pump cycle quickly when more water is needed.
+#define MEASURE_PAUSE_SEC 15
 
 // Seconds the pump must have been off before any routine moisture read
 #define PUMP_OFF_SETTLE_SEC 15

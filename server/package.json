@@ -5,16 +5,22 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "nodemon server.js"
+    "dev": "nodemon server.js",
+    "generate-vapid": "node scripts/generate-vapid.js"
   },
-  "keywords": ["greenhouse", "iot", "automation"],
+  "keywords": [
+    "greenhouse",
+    "iot",
+    "automation"
+  ],
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "express": "^4.18.2",
+    "body-parser": "^1.20.2",
     "cors": "^2.8.5",
+    "express": "^4.18.2",
     "sqlite3": "^5.1.6",
-    "body-parser": "^1.20.2"
+    "web-push": "^3.6.7"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
