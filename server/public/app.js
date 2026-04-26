@@ -5,37 +5,62 @@ let envChart = null;
 let moistureChart = null;
 let plantConfigs = {};
 
-// ─── Watering-lines plugin ────────────────────────────────────────────────────
-// Draws vertical dashed lines on the moisture chart at each watering event.
+// ─── Watering-dots plugin ────────────────────────────────────────────────────
+// Marks watering events on the moisture chart as small colored dots at the
+// top. When two or more events fall in close succession, the dots stack
+// vertically rather than drawing on top of each other.
 const wateringLinesPlugin = {
     id: 'wateringLines',
     afterDatasetsDraw(chart, _args, options) {
         const lines = options?.lines;
         if (!lines || lines.length === 0) return;
-        const { ctx, chartArea: { top, bottom }, scales: { x } } = chart;
+        const { ctx, chartArea: { top }, scales: { x } } = chart;
+
+        const RADIUS  = 4;
+        const SPACING = 9;   // vertical pixels between stacked dots
+        const GROUP_PX = 8;  // events within this horizontal distance get stacked
+
+        // Resolve pixel x for every event, drop any that fell off the scale
+        const items = lines
+            .map(l => ({ ...l, xPos: x.getPixelForValue(l.xIdx) }))
+            .filter(i => !isNaN(i.xPos))
+            .sort((a, b) => a.xPos - b.xPos);
+
+        // Group events whose dots would visually overlap
+        const groups = [];
+        let cur = [];
+        for (const item of items) {
+            if (cur.length === 0 || item.xPos - cur[cur.length - 1].xPos <= GROUP_PX) {
+                cur.push(item);
+            } else {
+                groups.push(cur);
+                cur = [item];
+            }
+        }
+        if (cur.length) groups.push(cur);
+
         ctx.save();
-        lines.forEach(line => {
-            const xPos = x.getPixelForValue(line.xIdx);
-            ctx.beginPath();
-            ctx.setLineDash([3, 3]);
-            ctx.strokeStyle = line.color;
-            ctx.lineWidth = 1.5;
-            ctx.moveTo(xPos, top);
-            ctx.lineTo(xPos, bottom);
-            ctx.stroke();
-        });
-        ctx.setLineDash([]);
-        lines.forEach(line => {
-            const xPos = x.getPixelForValue(line.xIdx);
-            ctx.font = 'bold 9px sans-serif';
-            const tw = ctx.measureText(line.label).width;
-            ctx.fillStyle = 'rgba(255,255,255,0.85)';
-            ctx.fillRect(xPos - tw / 2 - 2, top + 2, tw + 4, 12);
-            ctx.fillStyle = line.color;
-            ctx.textAlign = 'center';
-            ctx.textBaseline = 'top';
-            ctx.fillText(line.label, xPos, top + 3);
-        });
+        for (const group of groups) {
+            // Within a close-time cluster, only draw one dot per plant (colour)
+            const seen = new Set();
+            const unique = group.filter(item => {
+                if (seen.has(item.color)) return false;
+                seen.add(item.color);
+                return true;
+            });
+            // Centre the stack on the average x of the group
+            const avgX = unique.reduce((s, i) => s + i.xPos, 0) / unique.length;
+            unique.forEach((item, idx) => {
+                const dotY = top + RADIUS + 2 + idx * SPACING;
+                ctx.beginPath();
+                ctx.arc(avgX, dotY, RADIUS, 0, 2 * Math.PI);
+                ctx.fillStyle = item.color;
+                ctx.fill();
+                ctx.lineWidth = 1.5;
+                ctx.strokeStyle = 'white';
+                ctx.stroke();
+            });
+        }
         ctx.restore();
     }
 };
@@ -44,11 +69,268 @@ Chart.register(wateringLinesPlugin);
 // ─── Initialisation ───────────────────────────────────────────────────────────
 
 document.addEventListener('DOMContentLoaded', () => {
+    // Restore the chart range from the previous session
+    const savedHours = localStorage.getItem('chart-hours');
+    const hoursSelect = document.getElementById('chart-hours');
+    if (savedHours && hoursSelect && [...hoursSelect.options].some(o => o.value === savedHours)) {
+        hoursSelect.value = savedHours;
+    }
+    if (hoursSelect) {
+        hoursSelect.addEventListener('change', () => {
+            localStorage.setItem('chart-hours', hoursSelect.value);
+        });
+    }
+
     initCharts();
-    fetchStatus();
-    setInterval(fetchStatus, 2000);
-    setInterval(updateCharts, 5 * 60 * 1000);
+    fetchStatus();          // initial snapshot
+    initLiveUpdates();      // SSE for live updates (falls back to polling)
+    setInterval(updateCharts, 60 * 1000);
+
+    // PWA: register service worker, then surface the notification button if the
+    // browser supports push and we haven't already subscribed.
+    initPWA();
+    initPullToRefresh();
+    initChartTooltipDismiss();
 });
+
+// ─── Pull-to-refresh ─────────────────────────────────────────────────────────
+// Touch-only gesture. Pulling down past 80 px clears all caches, unregisters
+// the service worker, and reloads — guarantees the absolute latest version.
+
+function initPullToRefresh() {
+    const indicator = document.getElementById('refresh-indicator');
+    if (!indicator) return;
+    const icon = indicator.querySelector('svg');
+
+    const THRESHOLD = 80;
+    const MAX_PULL = 140;
+    let startY = 0;
+    let pullDist = 0;
+    let pulling = false;
+    let refreshing = false;
+
+    document.addEventListener('touchstart', (e) => {
+        if (refreshing || window.scrollY > 0 || e.touches.length !== 1) return;
+        startY = e.touches[0].clientY;
+        pulling = true;
+    }, { passive: true });
+
+    document.addEventListener('touchmove', (e) => {
+        if (!pulling || refreshing) return;
+        if (window.scrollY > 0) { resetIndicator(); pulling = false; return; }
+        pullDist = Math.max(0, e.touches[0].clientY - startY);
+        if (pullDist === 0) return;
+        const damped = Math.min(pullDist * 0.5, MAX_PULL);
+        indicator.style.transform = `translate(-50%, ${damped}px)`;
+        indicator.style.opacity = Math.min(pullDist / THRESHOLD, 1).toFixed(2);
+        icon.style.transform = `rotate(${Math.min((pullDist / THRESHOLD) * 360, 360)}deg)`;
+    }, { passive: true });
+
+    document.addEventListener('touchend', () => {
+        if (!pulling || refreshing) return;
+        pulling = false;
+        if (pullDist > THRESHOLD) {
+            triggerRefresh();
+        } else {
+            resetIndicator();
+        }
+        pullDist = 0;
+    });
+
+    function resetIndicator() {
+        indicator.style.transform = '';
+        indicator.style.opacity = '';
+        icon.style.transform = '';
+    }
+
+    async function triggerRefresh() {
+        refreshing = true;
+        // Settle indicator at top with spinner
+        indicator.style.transform = 'translate(-50%, 24px)';
+        indicator.style.opacity = '1';
+        icon.style.transform = '';
+        icon.classList.add('animate-spin');
+
+        try {
+            if ('caches' in window) {
+                const keys = await caches.keys();
+                await Promise.all(keys.map(k => caches.delete(k)));
+            }
+            if ('serviceWorker' in navigator) {
+                const regs = await navigator.serviceWorker.getRegistrations();
+                await Promise.all(regs.map(r => r.unregister()));
+            }
+        } catch (e) {
+            console.warn('Pull-to-refresh: cache clear failed', e);
+        }
+        location.reload();
+    }
+}
+
+// ─── Chart tooltip dismiss on tap-outside ────────────────────────────────────
+// Chart.js shows the tooltip on any tap with intersect:false, which on mobile
+// means the bubble sticks around. Dismiss it whenever the user taps outside
+// either canvas.
+
+function initChartTooltipDismiss() {
+    const dismissOutside = (event) => {
+        [envChart, moistureChart].forEach(chart => {
+            if (!chart || !chart.canvas) return;
+            if (!chart.canvas.contains(event.target)) {
+                chart.setActiveElements([]);
+                chart.tooltip?.setActiveElements?.([], { x: 0, y: 0 });
+                chart.update('none');
+            }
+        });
+    };
+    document.addEventListener('pointerdown', dismissOutside);
+}
+
+// ─── Live updates via Server-Sent Events ─────────────────────────────────────
+// Replaces 2-second polling — server pushes a 'status' event whenever data
+// changes (sensor POST, control click, calibration). Falls back to polling if
+// EventSource is unavailable or the connection drops repeatedly.
+
+let sseFailures = 0;
+let pollIntervalId = null;
+
+function initLiveUpdates() {
+    if (!('EventSource' in window)) {
+        startPolling();
+        return;
+    }
+
+    const es = new EventSource(`${API_BASE}/events`);
+
+    es.addEventListener('status', (e) => {
+        sseFailures = 0;
+        stopPolling();
+        try {
+            const data = JSON.parse(e.data);
+            updateUI(data);
+            updateConnectionStatus(true);
+        } catch (err) {
+            console.warn('SSE status parse error:', err);
+        }
+    });
+
+    es.onopen = () => {
+        sseFailures = 0;
+        stopPolling();
+        updateConnectionStatus(true);
+    };
+
+    es.onerror = () => {
+        // EventSource auto-reconnects; if it fails repeatedly, fall back to
+        // polling so the UI keeps refreshing.
+        sseFailures++;
+        updateConnectionStatus(false);
+        if (sseFailures >= 3 && !pollIntervalId) {
+            console.warn('SSE struggling — falling back to polling');
+            startPolling();
+        }
+    };
+}
+
+function startPolling() {
+    if (pollIntervalId) return;
+    pollIntervalId = setInterval(fetchStatus, 2000);
+}
+
+function stopPolling() {
+    if (pollIntervalId) {
+        clearInterval(pollIntervalId);
+        pollIntervalId = null;
+    }
+}
+
+// ─── PWA / Push notifications ────────────────────────────────────────────────
+
+async function initPWA() {
+    if (!('serviceWorker' in navigator)) return;
+
+    // When a new SW version activates, it sends SW_UPDATED — reload so we
+    // pick up the fresh app.js / index.html instead of running old code.
+    let reloading = false;
+    navigator.serviceWorker.addEventListener('message', (e) => {
+        if (e.data?.type === 'SW_UPDATED' && !reloading) {
+            reloading = true;
+            location.reload();
+        }
+    });
+
+    try {
+        const reg = await navigator.serviceWorker.register('/sw.js');
+
+        // If push is supported and not yet granted, show the Enable button
+        if ('PushManager' in window && Notification.permission !== 'granted') {
+            const btn = document.getElementById('notif-btn');
+            if (btn) btn.classList.remove('hidden');
+        }
+
+        // If we already have permission but no subscription (e.g. cleared cache),
+        // re-subscribe silently.
+        if (Notification.permission === 'granted') {
+            const existing = await reg.pushManager.getSubscription();
+            if (!existing) await subscribeToPush(reg);
+        }
+    } catch (e) {
+        console.warn('SW registration failed:', e);
+    }
+}
+
+async function enableNotifications() {
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+        alert('Notifications are not supported in this browser.');
+        return;
+    }
+
+    const permission = await Notification.requestPermission();
+    if (permission !== 'granted') {
+        alert('Notification permission was denied. You can re-enable it from your browser settings.');
+        return;
+    }
+
+    const reg = await navigator.serviceWorker.ready;
+    await subscribeToPush(reg);
+
+    const btn = document.getElementById('notif-btn');
+    if (btn) {
+        btn.textContent = '🔔 Alerts on';
+        btn.disabled = true;
+        btn.classList.remove('hover:bg-green-800');
+    }
+}
+
+async function subscribeToPush(reg) {
+    // Fetch the VAPID public key from the server
+    const keyRes = await fetch(`${API_BASE}/push/vapid-public-key`);
+    if (!keyRes.ok) {
+        console.warn('No VAPID key configured on server; push will be disabled.');
+        return;
+    }
+    const { key } = await keyRes.json();
+
+    const sub = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(key)
+    });
+
+    // Send subscription to server for storage
+    await fetch(`${API_BASE}/push/subscribe`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(sub)
+    });
+}
+
+// VAPID keys are base64url-encoded; PushManager wants a Uint8Array
+function urlBase64ToUint8Array(base64String) {
+    const padding = '='.repeat((4 - base64String.length % 4) % 4);
+    const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+    const raw = atob(base64);
+    return Uint8Array.from(raw, c => c.charCodeAt(0));
+}
 
 // ─── Status polling ───────────────────────────────────────────────────────────
 
@@ -83,8 +365,11 @@ function updateUI(data) {
         if (r.plants) {
             r.plants.forEach((plant, index) => {
                 const valveNum = index + 1;
-                const commandedOpen = data.system_state?.valves?.[valveNum] ?? plant.valve_state;
-                updatePlantUI(valveNum, plant, commandedOpen);
+                // Valve is "open" if either the user has manually triggered it
+                // OR the ESP32 reports the valve is currently open (auto-water).
+                const manualOpen = data.system_state?.valves?.[valveNum] === true;
+                const valveOpen  = manualOpen || plant.valve_state === true;
+                updatePlantUI(valveNum, plant, valveOpen);
             });
         }
     }
@@ -92,16 +377,6 @@ function updateUI(data) {
     if (data.system_state) {
         const state = data.system_state;
 
-        const autoBtn = document.getElementById('auto-mode-btn');
-        if (state.auto_mode) {
-            autoBtn.classList.remove('bg-green-700', 'text-green-200');
-            autoBtn.classList.add('bg-white', 'text-green-700');
-            autoBtn.textContent = 'AUTO ON';
-        } else {
-            autoBtn.classList.remove('bg-white', 'text-green-700');
-            autoBtn.classList.add('bg-green-700', 'text-green-200');
-            autoBtn.textContent = 'AUTO OFF';
-        }
 
         const anyValveOpen = state.valves && Object.values(state.valves).some(v => v);
         const pumpOn = anyValveOpen;
@@ -119,12 +394,12 @@ function updateUI(data) {
                 if (isActive) {
                     btn.classList.remove('bg-gray-200', 'text-gray-600');
                     btn.classList.add('bg-green-500', 'text-white');
-                    btn.textContent = 'ENABLED';
+                    btn.textContent = 'AUTO ON';
                     btn.onclick = () => enablePlant(i, false);
                 } else {
                     btn.classList.remove('bg-green-500', 'text-white');
                     btn.classList.add('bg-gray-200', 'text-gray-600');
-                    btn.textContent = 'DISABLED';
+                    btn.textContent = 'AUTO OFF';
                     btn.onclick = () => enablePlant(i, true);
                 }
             }
@@ -295,44 +570,80 @@ function updateConnectionStatus(connected) {
     text.textContent = connected ? 'Connected' : 'Connection Error';
 }
 
-// ─── Plant settings ───────────────────────────────────────────────────────────
+// ─── Plant settings (modal) ──────────────────────────────────────────────────
 
+let currentSettingsPlant = 0;  // 0 = closed; 1-4 = open for that plant
+
+// Called from each plant card's gear button. Opens the shared modal.
 function toggleSettings(plantNum) {
-    document.getElementById(`plant-${plantNum}-settings`)?.classList.toggle('hidden');
+    openSettings(plantNum);
 }
 
+function openSettings(plantNum) {
+    const cfg = plantConfigs[plantNum] ?? plantConfigs[String(plantNum)];
+    if (!cfg) return;
+
+    currentSettingsPlant = plantNum;
+    const name = cfg.name || `Plant ${plantNum}`;
+
+    document.getElementById('modal-title').textContent = name + ' — Settings';
+    document.getElementById('modal-name').value     = name;
+    document.getElementById('modal-dry').value      = cfg.soil_dry_threshold;
+    document.getElementById('modal-wet').value      = cfg.soil_wet_threshold;
+    document.getElementById('modal-duration').value = cfg.water_duration_sec;
+    document.getElementById('modal-cooldown').value = (cfg.cooldown_sec / 3600).toFixed(2);
+    document.getElementById('modal-cal-dry').textContent = cfg.dry_voltage_mv ? cfg.dry_voltage_mv : '--';
+    document.getElementById('modal-cal-wet').textContent = cfg.wet_voltage_mv ? cfg.wet_voltage_mv : '--';
+    document.getElementById('modal-msg').textContent = '';
+    document.getElementById('modal-cal-msg').textContent = '';
+
+    document.getElementById('settings-modal').classList.remove('hidden');
+    document.getElementById('modal-name').focus();
+}
+
+function closeSettings() {
+    currentSettingsPlant = 0;
+    document.getElementById('settings-modal').classList.add('hidden');
+}
+
+// Click on the dim backdrop closes; click inside the white card doesn't bubble.
+function closeSettingsIfBackdrop(event) {
+    if (event.target.id === 'settings-modal') closeSettings();
+}
+
+// Escape key closes the modal
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && currentSettingsPlant) closeSettings();
+});
+
+// Refresh the modal's calibration display when fresh data arrives via SSE.
+// Form fields are NOT touched — that would erase what the user is typing.
 function populateSettings(configs) {
     for (let i = 1; i <= 4; i++) {
         const cfg = configs[i] ?? configs[String(i)];
         if (!cfg) continue;
 
-        const setText = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
         const name = cfg.name || `Plant ${i}`;
-
-        // Always-updated bits — these don't conflict with anything the user can type
-        setText(`plant-${i}-cal-dry`, cfg.dry_voltage_mv ? cfg.dry_voltage_mv : '--');
-        setText(`plant-${i}-cal-wet`, cfg.wet_voltage_mv ? cfg.wet_voltage_mv : '--');
 
         const title = document.getElementById(`plant-${i}-title`);
         if (title) title.textContent = name;
         if (moistureChart) moistureChart.data.datasets[i - 1].label = name;
 
-        // Don't overwrite a panel that the user currently has open and may be editing
-        const panel = document.getElementById(`plant-${i}-settings`);
-        if (panel && !panel.classList.contains('hidden')) continue;
-
-        const set = (id, val) => { const el = document.getElementById(id); if (el) el.value = val; };
-        set(`plant-${i}-name`,     name);
-        set(`plant-${i}-dry`,      cfg.soil_dry_threshold);
-        set(`plant-${i}-wet`,      cfg.soil_wet_threshold);
-        set(`plant-${i}-duration`, cfg.water_duration_sec);
-        set(`plant-${i}-cooldown`, (cfg.cooldown_sec / 3600).toFixed(2));
+        // If modal is open for this plant, live-update the calibration readout
+        // (so a calibrate-button click shows the new mV right away).
+        if (currentSettingsPlant === i) {
+            document.getElementById('modal-cal-dry').textContent = cfg.dry_voltage_mv ? cfg.dry_voltage_mv : '--';
+            document.getElementById('modal-cal-wet').textContent = cfg.wet_voltage_mv ? cfg.wet_voltage_mv : '--';
+        }
     }
 }
 
-async function calibrateSensor(plantNum, type) {
-    const msgEl = document.getElementById(`plant-${plantNum}-cal-msg`);
-    const set = (cls, txt) => { msgEl.className = `block text-[11px] mt-1 ${cls}`; msgEl.textContent = txt; };
+async function calibrateSensor(type) {
+    const plantNum = currentSettingsPlant;
+    if (!plantNum) return;
+
+    const msgEl = document.getElementById('modal-cal-msg');
+    const set = (cls, txt) => { msgEl.className = `block text-xs mt-2 ${cls}`; msgEl.textContent = txt; };
     set('text-gray-500', 'Capturing latest reading...');
 
     try {
@@ -347,23 +658,25 @@ async function calibrateSensor(plantNum, type) {
             return;
         }
         set('text-green-600', `Saved ${type} at ${data.voltage_mv} mV`);
-        // Refresh status so the displayed cal values update
-        fetchStatus();
+        // SSE will push the updated calibration values; modal display updates via populateSettings
         setTimeout(() => { msgEl.textContent = ''; }, 4000);
     } catch (e) {
         set('text-red-600', 'Network error');
     }
 }
 
-async function savePlantConfig(plantNum) {
-    const get = id => document.getElementById(id)?.value;
-    const msgEl = document.getElementById(`plant-${plantNum}-settings-msg`);
+async function savePlantConfig() {
+    const plantNum = currentSettingsPlant;
+    if (!plantNum) return;
 
-    const name         = (get(`plant-${plantNum}-name`) || '').trim() || `Plant ${plantNum}`;
-    const dry          = parseFloat(get(`plant-${plantNum}-dry`));
-    const wet          = parseFloat(get(`plant-${plantNum}-wet`));
-    const duration     = parseInt(get(`plant-${plantNum}-duration`), 10);
-    const cooldownHrs  = parseFloat(get(`plant-${plantNum}-cooldown`));
+    const get = id => document.getElementById(id)?.value;
+    const msgEl = document.getElementById('modal-msg');
+
+    const name        = (get('modal-name') || '').trim() || `Plant ${plantNum}`;
+    const dry         = parseFloat(get('modal-dry'));
+    const wet         = parseFloat(get('modal-wet'));
+    const duration    = parseInt(get('modal-duration'), 10);
+    const cooldownHrs = parseFloat(get('modal-cooldown'));
 
     const err = (msg) => { msgEl.textContent = msg; msgEl.className = 'text-xs text-red-600'; };
 
@@ -390,9 +703,8 @@ async function savePlantConfig(plantNum) {
             return err(e.message || 'Save failed.');
         }
 
-        msgEl.textContent = 'Saved.';
-        msgEl.className = 'text-xs text-green-600';
-        setTimeout(() => { msgEl.textContent = ''; }, 3000);
+        // Saved successfully — close the modal
+        closeSettings();
     } catch (e) {
         err('Network error.');
     }
@@ -404,11 +716,6 @@ async function toggleValve(plantNum) {
     const btn = document.getElementById(`plant-${plantNum}-valve-btn`);
     const isOpen = btn?.dataset.open === 'true';
     await controlValve(plantNum, !isOpen);
-}
-
-async function toggleAutoMode() {
-    if (!currentStatus?.system_state) return;
-    await sendControl({ action: 'auto_mode', enabled: !currentStatus.system_state.auto_mode });
 }
 
 async function controlValve(valveNum, state) {
@@ -445,6 +752,7 @@ const PLANT_COLORS = [
 
 const CHART_OPTS = {
     responsive: true,
+    maintainAspectRatio: false,
     animation: false,
     interaction: { mode: 'index', intersect: false },
     plugins: { legend: { position: 'bottom', labels: { boxWidth: 12, padding: 12 } } },
